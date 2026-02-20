@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>iCamera AI - iOS 26</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap');
+        body { 
+            background: #000; 
+            color: #fff; 
+            overflow: hidden; 
+            margin: 0; 
+            font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
+        }
+
+        .glass-ios {
+            background: rgba(10, 10, 10, 0.4);
+            backdrop-filter: blur(35px);
+            -webkit-backdrop-filter: blur(35px);
+            border-top: 1px solid rgba(255,255,255,0.08);
+        }
+
+        .shutter-ring {
+            width: 78px;
+            height: 78px;
+            border: 4px solid #fff;
+            border-radius: 50%;
+            padding: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .shutter-disk {
+            width: 100%;
+            height: 100%;
+            background: #fff;
+            border-radius: 50%;
+            transition: transform 0.1s;
+        }
+
+        .shutter-ring:active .shutter-disk { transform: scale(0.85); }
+
+        .focus-box {
+            position: absolute;
+            width: 70px;
+            height: 70px;
+            border: 1.5px solid #FFD60A;
+            pointer-events: none;
+            z-index: 50;
+        }
+
+        .ev-indicator {
+            position: absolute;
+            left: 85px;
+            top: 50%;
+            transform: translateY(-50%);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 4px;
+            color: #FFD60A;
+        }
+
+        .ai-line {
+            width: 100%;
+            height: 2px;
+            background: #3b82f6;
+            position: absolute;
+            z-index: 90;
+            box-shadow: 0 0 20px #3b82f6;
+            animation: scan 1.5s linear infinite;
+        }
+        @keyframes scan { 0% { top: 0; } 100% { top: 100%; } }
+
+        .safe-top { padding-top: env(safe-area-inset-top); }
+        .safe-bottom { padding-bottom: env(safe-area-inset-bottom); }
+        
+        .zoom-btn {
+            background: rgba(255, 255, 255, 0.15);
+            width: 34px;
+            height: 34px;
+            border-radius: 50%;
+            font-size: 10px;
+            font-weight: 800;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #aaa;
+            transition: all 0.2s;
+        }
+        .zoom-btn.active {
+            background: #fff;
+            color: #000;
+            transform: scale(1.15);
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        function App() {
+            const [isReady, setIsReady] = useState(false);
+            const [zoom, setZoom] = useState(1);
+            const [ev, setEv] = useState(0);
+            const [flash, setFlash] = useState(false);
+            const [focusPos, setFocusPos] = useState(null);
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [enhancedImg, setEnhancedImg] = useState(null);
+            
+            const videoRef = useRef(null);
+            const canvasRef = useRef(null);
+            const trackRef = useRef(null);
+            const lastY = useRef(0);
+            const apiKey = ""; 
+
+            // Hard init buat APK
+            const initCam = async () => {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({
+                        video: { facingMode: 'environment', width: { ideal: 3840 }, height: { ideal: 2160 } },
+                        audio: false
+                    });
+                    if (videoRef.current) {
+                        videoRef.current.srcObject = stream;
+                        trackRef.current = stream.getVideoTracks()[0];
+                        
+                        // Tunggu sampe video beneran muter baru buka UI
+                        videoRef.current.onplay = () => setIsReady(true);
+                    }
+                } catch (err) {
+                    alert("Kamera ditolak atau gak ketemu. Cek izin di setting HP lu bro.");
+                }
+            };
+
+            // Sync Lampu & EV ke hardware
+            useEffect(() => {
+                if (trackRef.current) {
+                    trackRef.current.applyConstraints({
+                        advanced: [{ torch: flash, exposureCompensation: ev }]
+                    }).catch(() => {});
+                }
+            }, [flash, ev]);
+
+            const handleTouchStart = (e) => {
+                if (!isReady) return;
+                const rect = e.currentTarget.getBoundingClientRect();
+                const x = e.touches[0].clientX - rect.left;
+                const y = e.touches[0].clientY - rect.top;
+                
+                setFocusPos({ x, y });
+                lastY.current = e.touches[0].clientY;
+
+                // Reset kotak fokus setelah 4 detik
+                setTimeout(() => setFocusPos(null), 4000);
+            };
+
+            const handleTouchMove = (e) => {
+                if (!focusPos) return;
+                
+                const currentY = e.touches[0].clientY;
+                const diff = (lastY.current - currentY) / 100; // Sensitivitas geser
+                
+                setEv(prev => {
+                    const val = prev + diff;
+                    return Math.max(-2, Math.min(2, val));
+                });
+                
+                lastY.current = currentY;
+            };
+
+            const capture = async () => {
+                if (isProcessing || !isReady) return;
+                
+                const video = videoRef.current;
+                const canvas = canvasRef.current;
+                const ctx = canvas.getContext('2d');
+                
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+
+                // Crop sesuai zoom
+                const sw = video.videoWidth / zoom;
+                const sh = video.videoHeight / zoom;
+                const sx = (video.videoWidth - sw) / 2;
+                const sy = (video.videoHeight - sh) / 2;
+
+                ctx.filter = `brightness(${1 + (ev * 0.12)})`;
+                ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+                
+                const b64 = canvas.toDataURL('image/png').split(',')[1];
+                setIsProcessing(true);
+
+                try {
+                    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            contents: [{
+                                parts: [
+                                    { text: "Enhance this zoomed photo. Sharp the edges, remove noise, and reconstruct details. Return only the image." },
+                                    { inlineData: { mimeType: "image/png", data: b64 } }
+                                ]
+                            }],
+                            generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
+                        })
+                    });
+
+                    const data = await response.json();
+                    const aiB64 = data.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
+                    if (aiB64) setEnhancedImg(`data:image/png;base64,${aiB64}`);
+                } catch (e) {
+                    alert("AI lagi capek. Coba lagi bentar.");
+                } finally {
+                    setIsProcessing(false);
+                }
+            };
+
+            return (
+                <div className="h-screen w-screen bg-black relative flex flex-col select-none overflow-hidden">
+                    
+                    {/* Viewfinder - Stay in DOM */}
+                    <div 
+                        className="flex-1 relative overflow-hidden"
+                        onTouchStart={handleTouchStart}
+                        onTouchMove={handleTouchMove}
+                    >
+                        <video 
+                            ref={videoRef} autoPlay playsInline muted 
+                            className="absolute w-full h-full object-cover"
+                            style={{ 
+                                transform: `scale(${zoom})`,
+                                filter: `brightness(${1 + (ev * 0.08)})` 
+                            }}
+                        />
+
+                        {/* Fokus UI & Swipe EV Visual */}
+                        {focusPos && (
+                            <div className="focus-box" style={{ top: focusPos.y - 35, left: focusPos.x - 35 }}>
+                                <div className="ev-indicator">
+                                    <i data-lucide="sun" size={16}></i>
+                                    <div className="w-[1px] h-14 bg-white/20 relative">
+                                        <div 
+                                            className="absolute w-1.5 h-1.5 bg-yellow-400 rounded-full left-[-2.5px]" 
+                                            style={{ bottom: `${((ev + 2) / 4) * 100}%` }}
+                                        ></div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Grid */}
+                        <div className="absolute inset-0 pointer-events-none opacity-20 flex">
+                            <div className="flex-1 border-r border-white/40"></div>
+                            <div className="flex-1 border-r border-white/40"></div>
+                            <div className="flex-1"></div>
+                            <div className="absolute inset-0 flex flex-col">
+                                <div className="flex-1 border-b border-white/40"></div>
+                                <div className="flex-1 border-b border-white/40"></div>
+                                <div className="flex-1"></div>
+                            </div>
+                        </div>
+
+                        {/* AI Loading */}
+                        {isProcessing && (
+                            <div className="absolute inset-0 bg-black/60 backdrop-blur-md z-[80] flex items-center justify-center">
+                                <div className="ai-line"></div>
+                                <p className="text-blue-400 font-bold tracking-[0.5em] text-[10px] animate-pulse uppercase">Neural Processing</p>
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Top UI Overlay */}
+                    <div className="absolute top-0 w-full z-40 safe-top px-6 py-4 flex justify-between items-center bg-gradient-to-b from-black/80 to-transparent">
+                        <button onClick={() => setFlash(!flash)} className={flash ? "text-yellow-400" : "text-white"}>
+                            <i data-lucide={flash ? "zap" : "zap-off"} size={22}></i>
+                        </button>
+                        <div className="flex items-center gap-1.5 opacity-60">
+                             <div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></div>
+                             <span className="text-[10px] font-black tracking-widest text-white uppercase">AI LIVE</span>
+                        </div>
+                        <div className="w-6"></div>
+                    </div>
+
+                    {/* Footer Controls - iOS 26 Style */}
+                    <div className="glass-ios safe-bottom flex flex-col items-center">
+                        <div className="flex gap-4 pt-6 pb-2">
+                            {[1, 2, 5, 10, 20].map(z => (
+                                <button 
+                                    key={z} 
+                                    onClick={() => setZoom(z)} 
+                                    className={`zoom-btn ${zoom === z ? 'active' : ''}`}
+                                >
+                                    {z}
+                                </button>
+                            ))}
+                        </div>
+
+                        <div className="py-4">
+                            <span className="text-yellow-400 font-black tracking-[0.2em] text-[10px] uppercase border-b-2 border-yellow-400 pb-1.5 px-1">Photo</span>
+                        </div>
+
+                        <div className="w-full flex justify-around items-center px-10 pb-12">
+                            <div className="w-12 h-12 bg-white/5 rounded-2xl border border-white/10 overflow-hidden flex items-center justify-center">
+                                {enhancedImg ? (
+                                    <img src={enhancedImg} className="w-full h-full object-cover" />
+                                ) : (
+                                    <div className="w-full h-full bg-zinc-900"></div>
+                                )}
+                            </div>
+                            
+                            <button onClick={capture} className="shutter-ring active:scale-95 transition-transform">
+                                <div className="shutter-disk"></div>
+                            </button>
+
+                            <button onClick={initCam} className="w-12 h-12 flex items-center justify-center bg-white/5 rounded-full border border-white/10 active:rotate-180 transition-transform duration-500">
+                                <i data-lucide="refresh-cw" size={20}></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* Startup Permission Overlay */}
+                    {!isReady && (
+                        <div className="fixed inset-0 z-[200] bg-black flex flex-col items-center justify-center p-12 text-center">
+                            <div className="w-24 h-24 bg-white/5 rounded-full flex items-center justify-center mb-8 border border-white/10 shadow-[0_0_50px_rgba(255,255,255,0.05)]">
+                                <i data-lucide="camera" className="text-white opacity-40" size={40}></i>
+                            </div>
+                            <h1 className="text-2xl font-black mb-3 tracking-tight">iCamera AI</h1>
+                            <p className="text-[10px] text-zinc-500 mb-12 uppercase tracking-[0.2em] leading-relaxed">
+                                Powered by Neural Engine v26
+                            </p>
+                            <button 
+                                onClick={initCam}
+                                className="w-full max-w-xs bg-white text-black font-black py-5 rounded-[2rem] active:scale-95 transition shadow-2xl"
+                            >
+                                IZINKAN KAMERA
+                            </button>
+                        </div>
+                    )}
+
+                    {/* Fullscreen AI Preview */}
+                    {enhancedImg && (
+                        <div className="fixed inset-0 z-[300] bg-black flex flex-col animate-in fade-in slide-in-from-bottom-10 duration-500">
+                            <div className="flex justify-between items-center p-6 safe-top border-b border-white/5">
+                                <span className="text-[10px] font-black text-blue-400 tracking-widest">AI SUPER RES</span>
+                                <button onClick={() => setEnhancedImg(null)} className="p-2 bg-white/10 rounded-full"><i data-lucide="x" size={22}></i></button>
+                            </div>
+                            <div className="flex-1 p-4 flex items-center justify-center bg-[#050505] overflow-hidden">
+                                <img src={enhancedImg} className="max-w-full max-h-full rounded-[2.5rem] shadow-2xl object-contain border border-white/5" />
+                            </div>
+                            <div className="p-8 pb-safe-bottom bg-black">
+                                <button className="w-full bg-blue-600 py-5 rounded-[2rem] font-black text-sm active:scale-95 transition tracking-widest uppercase">
+                                    Simpan ke Galeri
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    <canvas ref={canvasRef} className="hidden" />
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+        
+        setTimeout(() => { if(window.lucide) window.lucide.createIcons(); }, 500);
+    </script>
+</body>
+</html>
+
